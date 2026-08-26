@@ -3,7 +3,102 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Guardian 504 | Segurança</title>
+<script id="portal504Guard">
+(() => {
+  "use strict";
+  document.documentElement.classList.add("portal-auth-pending");
+
+  const AUTH = {
+    usuario: "acesso",
+    senhaHash: "1j78k6ardjv",
+    storageKey: "portal504_auth_v1"
+  };
+
+  function hashCredential(value) {
+    let h1 = 0xdeadbeef ^ value.length;
+    let h2 = 0x41c6ce57 ^ value.length;
+    for (let i = 0, ch; i < value.length; i++) {
+      ch = value.charCodeAt(i);
+      h1 = Math.imul(h1 ^ ch, 2654435761);
+      h2 = Math.imul(h2 ^ ch, 1597334677);
+    }
+    h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+    h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+    return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
+  }
+
+  const sessionToken = hashCredential(`portal504|${AUTH.usuario}|${AUTH.senhaHash}|autorizado`);
+
+  function sessaoValida(sessao) {
+    return Boolean(
+      sessao &&
+      sessao.token === sessionToken &&
+      Number.isFinite(sessao.expiraEm) &&
+      Date.now() < sessao.expiraEm
+    );
+  }
+
+  function lerSessaoJanela() {
+    try {
+      if (!window.name.startsWith("PORTAL504_AUTH:")) return null;
+      const payload = window.name.slice("PORTAL504_AUTH:".length);
+      const sessao = JSON.parse(decodeURIComponent(payload));
+      return sessaoValida(sessao) ? sessao : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function lerSessaoLocal() {
+    try {
+      const raw = localStorage.getItem(AUTH.storageKey);
+      if (!raw) return null;
+      const sessao = JSON.parse(raw);
+      if (!sessaoValida(sessao)) return null;
+      try {
+        window.name = `PORTAL504_AUTH:${encodeURIComponent(JSON.stringify(sessao))}`;
+      } catch (_) {}
+      return sessao;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function obterLoginCentral() {
+    try {
+      const atual = new URL(window.location.href);
+      const lower = atual.pathname.toLowerCase();
+      const marker = "/lobby/";
+      const pos = lower.lastIndexOf(marker);
+
+      if (pos >= 0) {
+        atual.pathname = atual.pathname.slice(0, pos) + "/Portal Indicadores/index.html";
+        atual.search = "";
+        atual.hash = "";
+        return atual.href;
+      }
+    } catch (_) {}
+
+    // Estrutura esperada: Lobby/Portal Segurança/index_seguranca_504.html
+    return new URL("../../Portal Indicadores/index.html", window.location.href).href;
+  }
+
+  if (lerSessaoJanela() || lerSessaoLocal()) {
+    document.documentElement.classList.remove("portal-auth-pending");
+    document.documentElement.classList.add("portal-auth-ok");
+    return;
+  }
+
+  const login = obterLoginCentral();
+  const retorno = window.location.href;
+  const destino = `${login}?retorno=${encodeURIComponent(retorno)}`;
+  window.location.replace(destino);
+})();
+</script>
+
 <style>
+html.portal-auth-pending body{visibility:hidden!important}
+
 :root{
   --bg:#08111f;--panel:#101b2e;--panel2:#13223a;--text:#eef4ff;--muted:#91a3bd;
   --accent:#38bdf8;--good:#34d399;--warn:#fbbf24;--bad:#fb7185;--purple:#a78bfa;
