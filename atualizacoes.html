@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Central de Atualizações | Linha 504</title>
+  <link rel="stylesheet" href="atualizacoes.css">
+</head>
+<body class="updates-auth-pending">
+  <main class="updates-page" id="updatesPage" hidden>
+    <header class="updates-header">
+      <div class="line-badge">LINHA <b>504</b></div>
+      <div>
+        <div class="eyebrow">PORTAL DE INDICADORES</div>
+        <h1>Central de Atualizações</h1>
+        <p>Status operacional, histórico e execução das automações dos portais.</p>
+      </div>
+      <div class="header-actions">
+        <div class="agent-pill" id="agentPill"><i></i><span>Verificando ambiente...</span></div>
+        <a class="back" href="index.html">← Portal de Indicadores</a>
+      </div>
+    </header>
+
+    <section class="environment" id="environmentPanel">
+      <div><strong>Ambiente do VD</strong><span id="environmentText">Verificando Node e caminhos das automações...</span></div>
+      <button id="refreshStatus" type="button">Atualizar status</button>
+    </section>
+
+    <section class="summary-grid" aria-label="Resumo das atualizações">
+      <div class="summary-card"><span>Automações disponíveis</span><strong id="availableCount">—</strong><small>de 4 fluxos automáticos</small></div>
+      <div class="summary-card"><span>Em execução</span><strong id="runningCount">—</strong><small>uma automação por vez</small></div>
+      <div class="summary-card"><span>Último sucesso</span><strong id="lastSuccess">—</strong><small id="lastSuccessDetail">sem histórico local</small></div>
+    </section>
+
+    <section class="section-head"><div><span>AUTOMAÇÕES</span><h2>Atualização automática</h2></div><p>O Portal de Indicadores permanece aberto. TPO e UP são executados diretamente pelos scripts Node/Playwright, sem o fechamento global do Chrome.</p></section>
+    <section class="automation-grid" id="automationGrid"></section>
+
+    <section class="section-head manual-head"><div><span>CONTINGÊNCIA</span><h2>Atualização manual / sem relatório automático</h2></div><p>Os modos manuais existentes nos portais foram preservados.</p></section>
+    <section class="manual-grid">
+      <article class="manual-card"><div class="manual-icon people">G</div><div><h3>Portal Gente</h3><p>Dados e rotinas mensais. Não há fluxo de relatório automático nesta Central.</p></div><span>GESTÃO DIRETA</span></article>
+      <article class="manual-card"><div class="manual-icon quality">M</div><div><h3>Mal Cheia</h3><p>Atualização permanece manual. O portal continua acessível normalmente pelo card de Qualidade.</p></div><span>MANUAL</span></article>
+    </section>
+
+    <section class="history-panel">
+      <div class="history-head"><div><span>HISTÓRICO</span><h2>Últimas execuções</h2></div><div class="history-note">Registrado localmente pelo agente da Central 504</div></div>
+      <div class="table-wrap"><table><thead><tr><th>Portal</th><th>Início</th><th>Fim</th><th>Duração</th><th>Resultado</th></tr></thead><tbody id="historyBody"><tr><td colspan="5">Carregando...</td></tr></tbody></table></div>
+    </section>
+
+    <section class="info-box"><b>Importante:</b> a atualização automática depende do VD ter Node.js e acesso aos caminhos N:. Se a Central local não estiver iniciada, abra o portal pelo arquivo <code>INICIAR_PORTAL_504.bat</code>. A atualização manual de cada portal continua disponível como contingência.</section>
+    <footer>SEGURANÇA • QUALIDADE • PERFORMANCE • PESSOAS</footer>
+  </main>
+  <script src="atualizacoes.js"></script>
+</body>
+</html>
