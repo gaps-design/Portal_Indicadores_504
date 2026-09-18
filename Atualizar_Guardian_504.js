@@ -16,6 +16,13 @@ const TIPOS = [
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const log = m => console.log(`[${new Date().toLocaleTimeString('pt-BR')}] ${m}`);
 
+// Dentro desta janela, um pedido correto já existente é reaproveitado.
+// Isso evita gerar de novo Comportamento/Condição/Incidente quando,
+// por exemplo, só Reconhecimento ficou faltando na tentativa anterior.
+const REUSO_MINUTOS = Number(CFG.reuse_window_minutes || 30);
+
+const EXECUTADO_PELA_CENTRAL = process.env.PORTAL504_CENTRAL === '1';
+
 function pad2(n){ return String(n).padStart(2,'0'); }
 function periodoAtual(){
   const d = new Date();
@@ -87,36 +94,139 @@ async function abrirDownloads(page){
   await sleep(1200);
 }
 
-async function infoUltimaLinha(page,item,p){
-  await abrirDownloads(page);
-
-  const rows = page.locator('tr').filter({hasText:item.nome});
-  const n = await rows.count();
-  if(!n) return {row:null,count:0,text:''};
-
-  // Procura primeiro uma linha do tipo que também contenha a data final atual.
-  for(let i=n-1;i>=0;i--){
-    const r = rows.nth(i);
-    const txt = (await r.innerText().catch(()=>'' )).replace(/\s+/g,' ').trim();
-    if(txt.includes(p.fim)){
-      return {row:r,count:n,text:txt};
-    }
-  }
-
-  const r = rows.nth(n-1);
-  const txt = (await r.innerText().catch(()=>'' )).replace(/\s+/g,' ').trim();
-  return {row:r,count:n,text:txt};
+function tiposNaLinha(texto){
+  const normalizado=(texto || '').replace(/\s+/g,' ').trim();
+  return TIPOS
+    .map(x=>x.nome)
+    .filter(nome=>normalizado.includes(nome));
 }
 
-async function linhaExiste(page,item,p){
-  const info=await infoUltimaLinha(page,item,p);
-  if(!info.row) return false;
+function linhaEhDoTipoExato(texto,item){
+  const encontrados=tiposNaLinha(texto);
+  return encontrados.length===1 && encontrados[0]===item.nome;
+}
 
-  // Só considera atual se a linha trouxer a data final de hoje.
-  if(!info.text.includes(p.fim)) return false;
-
-  log(`Já existe pedido atual de ${item.nome}.`);
+function linhaTemLocalidadeCorreta(texto){
+  // O Guardian não expõe "Local do evento = Dentro unidade" de forma confiável
+  // na tabela de Downloads. Portanto a validação da localidade é feita
+  // imediatamente antes da exportação, na tela de filtros.
   return true;
+}
+
+function extrairDataSolicitacao(texto){
+  // Pega o primeiro DD/MM/AAAA HH:MM da linha, que é "Data da solicitação".
+  const m=(texto || '').match(/\b(\d{2})\/(\d{2})\/(\d{4})\s+(\d{2}):(\d{2})\b/);
+  if(!m) return null;
+
+  const d=new Date(
+    Number(m[3]),
+    Number(m[2])-1,
+    Number(m[1]),
+    Number(m[4]),
+    Number(m[5]),
+    0,
+    0
+  );
+
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function idadeMinutos(data){
+  if(!data) return Infinity;
+  return Math.max(0,(Date.now()-data.getTime())/60000);
+}
+
+function statusPedido(texto){
+  if(/Pronto para download/i.test(texto || '')) return 'pronto';
+  if(/Falha|Erro/i.test(texto || '')) return 'erro';
+  return 'processando';
+}
+
+async function listarLinhasValidasAtuais(page,item,p){
+  await abrirDownloads(page);
+
+  const candidatas=page.locator('tr').filter({hasText:item.nome});
+  const n=await candidatas.count();
+  const validas=[];
+
+  for(let i=0;i<n;i++){
+    const row=candidatas.nth(i);
+    const texto=(await row.innerText().catch(()=>'' )).replace(/\s+/g,' ').trim();
+
+    // O pedido só é considerado correto se tiver:
+    // - período deste mês até hoje
+    // - tipo EXATO (sem "Incidente, Reconhecimento", etc.)
+    // - Local do evento é aplicado na geração como Dentro unidade
+    if(!texto.includes(p.inicio) || !texto.includes(p.fim)) continue;
+    if(!linhaEhDoTipoExato(texto,item)) continue;
+    if(!linhaTemLocalidadeCorreta(texto)) continue;
+
+    const dataSolicitacao=extrairDataSolicitacao(texto);
+
+    validas.push({
+      row,
+      texto,
+      dataSolicitacao,
+      status:statusPedido(texto),
+      idadeMin:idadeMinutos(dataSolicitacao)
+    });
+  }
+
+  // Mais recente primeiro. Se não conseguirmos ler o horário,
+  // essa linha fica por último e não ganha prioridade.
+  validas.sort((a,b)=>{
+    const ta=a.dataSolicitacao ? a.dataSolicitacao.getTime() : 0;
+    const tb=b.dataSolicitacao ? b.dataSolicitacao.getTime() : 0;
+    return tb-ta;
+  });
+
+  return validas;
+}
+
+async function infoUltimaLinha(page,item,p){
+  const validas=await listarLinhasValidasAtuais(page,item,p);
+
+  if(!validas.length){
+    return {
+      row:null,
+      count:0,
+      text:'',
+      dataSolicitacao:null,
+      status:null,
+      idadeMin:Infinity
+    };
+  }
+
+  const v=validas[0];
+  return {
+    row:v.row,
+    count:validas.length,
+    text:v.texto,
+    dataSolicitacao:v.dataSolicitacao,
+    status:v.status,
+    idadeMin:v.idadeMin
+  };
+}
+
+async function infoPedidoRecente(page,item,p){
+  const info=await infoUltimaLinha(page,item,p);
+
+  if(!info.row) return null;
+  if(!Number.isFinite(info.idadeMin)) return null;
+
+  // Pedido com erro não é reaproveitado.
+  if(info.status==='erro') return null;
+
+  if(info.idadeMin<=REUSO_MINUTOS){
+    return info;
+  }
+
+  return null;
+}
+
+async function contarPedidosValidosAtuais(page,item,p){
+  const validas=await listarLinhasValidasAtuais(page,item,p);
+  return validas.length;
 }
 
 async function limparFiltros(page){
@@ -216,32 +326,258 @@ async function preencherDatas(page,p){
   await setData(fim,p.fim,'Data final');
 }
 
-async function selecionarTipo(page,tipo){
-  log(`Selecionando tipo: ${tipo}`);
-
+async function localizarCampoTipo(page){
   let sel=page.locator('[data-testid="register-type-multi-select-component"]').first();
   if(!(await sel.count())) sel=page.locator('nz-select[aria-label="Tipo de registro"]').first();
   if(!(await sel.count())) sel=page.locator('[aria-label="Tipo de registro"]').first();
 
-  if(!(await sel.count())) throw new Error('Não encontrei o campo "Tipo de registro".');
-
-  const atual=(await sel.innerText().catch(()=>'' )).trim();
-  if(atual.includes(tipo)){
-    log(`Tipo já selecionado: ${tipo}`);
-    return;
+  if(!(await sel.count())){
+    throw new Error('Não encontrei o campo "Tipo de registro".');
   }
+
+  return sel;
+}
+
+function nomesConhecidosNoTexto(texto){
+  const normalizado=(texto || '').replace(/\s+/g,' ').trim();
+  return TIPOS.map(x=>x.nome).filter(nome=>normalizado.includes(nome));
+}
+
+async function selecionadosNoCampo(sel){
+  const txt=await sel.innerText().catch(()=> '');
+  return nomesConhecidosNoTexto(txt);
+}
+
+async function selecionadosNoDropdown(page){
+  const locators=[
+    '.cdk-overlay-container nz-option-item.ant-select-item-option-selected:visible',
+    '.cdk-overlay-container .ant-select-item-option-selected:visible',
+    '.ant-select-dropdown:visible nz-option-item.ant-select-item-option-selected',
+    '.ant-select-dropdown:visible .ant-select-item-option-selected'
+  ];
+
+  for(const s of locators){
+    const opts=page.locator(s);
+    const n=await opts.count().catch(()=>0);
+
+    if(!n) continue;
+
+    const nomes=[];
+    for(let i=0;i<n;i++){
+      const txt=(await opts.nth(i).innerText().catch(()=>'' )).replace(/\s+/g,' ').trim();
+      for(const item of TIPOS){
+        if(txt===item.nome || txt.includes(item.nome)){
+          if(!nomes.includes(item.nome)) nomes.push(item.nome);
+        }
+      }
+    }
+    return {locator:opts,nomes};
+  }
+
+  return {locator:null,nomes:[]};
+}
+
+async function limparSelecoesTipo(page){
+  const sel=await localizarCampoTipo(page);
+  log('Limpando completamente o filtro "Tipo de registro"...');
+
+  // Abre o multi-select para enxergar as opções realmente marcadas.
+  await sel.click({timeout:10000});
+  await sleep(450);
+
+  // 1) Desmarca diretamente TODAS as opções que o Guardian mantém selecionadas.
+  for(let rodada=0;rodada<10;rodada++){
+    const info=await selecionadosNoDropdown(page);
+
+    if(!info.nomes.length) break;
+
+    log(`Desmarcando: ${info.nomes.join(', ')}`);
+
+    // Reconsulta a cada clique porque o DOM do dropdown muda ao desmarcar.
+    const nome=info.nomes[0];
+
+    let opt=page.locator(
+      `.cdk-overlay-container nz-option-item.ant-select-item-option-selected[title="${nome}"]:visible`
+    ).last();
+
+    if(!(await opt.count())){
+      opt=page.locator(
+        `.cdk-overlay-container .ant-select-item-option-selected[title="${nome}"]:visible`
+      ).last();
+    }
+
+    if(!(await opt.count())){
+      opt=page.getByText(nome,{exact:true}).filter({visible:true}).last();
+    }
+
+    if(await opt.count()){
+      await opt.click({timeout:8000,force:true}).catch(()=>{});
+      await sleep(350);
+    }else{
+      break;
+    }
+  }
+
+  await page.keyboard.press('Escape').catch(()=>{});
+  await sleep(250);
+
+  // 2) Se ainda houver chips no campo, tenta remover pelo X.
+  for(let rodada=0;rodada<10;rodada++){
+    const restantes=await selecionadosNoCampo(sel);
+    if(!restantes.length) break;
+
+    const remover=sel.locator(
+      '.ant-select-selection-item-remove, nz-select-item .anticon-close, nz-select-item [nztype="close"]'
+    ).first();
+
+    if(await remover.count() && await remover.isVisible().catch(()=>false)){
+      await remover.click({timeout:5000,force:true}).catch(()=>{});
+      await sleep(250);
+      continue;
+    }
+
+    // 3) Último fallback para Ant Design multi-select: Backspace remove último chip.
+    await sel.click({timeout:5000}).catch(()=>{});
+    await page.keyboard.press('End').catch(()=>{});
+    await page.keyboard.press('Backspace').catch(()=>{});
+    await sleep(250);
+    await page.keyboard.press('Escape').catch(()=>{});
+  }
+
+  const restantes=await selecionadosNoCampo(sel);
+
+  if(restantes.length){
+    throw new Error(
+      `Não consegui limpar "Tipo de registro". Ainda selecionado(s): ${restantes.join(', ')}`
+    );
+  }
+
+  log('Filtro "Tipo de registro" zerado.');
+}
+
+async function selecionarTipo(page,tipo){
+  await limparSelecoesTipo(page);
+
+  log(`Selecionando SOMENTE: ${tipo}`);
+  const sel=await localizarCampoTipo(page);
 
   await sel.click({timeout:10000});
   await sleep(450);
 
-  let opt=page.locator(`nz-option-item[title="${tipo}"]`).last();
+  let opt=page.locator(`.cdk-overlay-container nz-option-item[title="${tipo}"]:visible`).last();
+  if(!(await opt.count())) opt=page.locator(`.cdk-overlay-container .ant-select-item-option[title="${tipo}"]:visible`).last();
+  if(!(await opt.count())) opt=page.locator(`nz-option-item[title="${tipo}"]`).last();
   if(!(await opt.count())) opt=page.locator(`.ant-select-item-option[title="${tipo}"]`).last();
   if(!(await opt.count())) opt=page.getByText(tipo,{exact:true}).last();
 
-  if(!(await opt.count())) throw new Error(`Não encontrei a opção "${tipo}".`);
+  if(!(await opt.count())){
+    throw new Error(`Não encontrei a opção "${tipo}".`);
+  }
 
   await opt.click({timeout:10000});
-  await sleep(550);
+  await sleep(500);
+
+  // Validação real no dropdown: só uma opção conhecida pode estar selecionada.
+  const real=await selecionadosNoDropdown(page);
+  await page.keyboard.press('Escape').catch(()=>{});
+  await sleep(250);
+
+  let selecionados=real.nomes;
+
+  // Fallback pela renderização dos chips do campo.
+  if(!selecionados.length){
+    selecionados=await selecionadosNoCampo(sel);
+  }
+
+  if(selecionados.length!==1 || selecionados[0]!==tipo){
+    throw new Error(
+      `Filtro inválido antes da busca. Esperado SOMENTE "${tipo}", mas o Guardian mostra: ` +
+      (selecionados.length ? selecionados.join(', ') : 'nenhum tipo')
+    );
+  }
+
+  log(`Filtro confirmado: SOMENTE "${tipo}".`);
+}
+
+
+async function localizarCampoLocalEvento(page){
+  const candidatos=[
+    'input[placeholder="Local do evento"]',
+    '[placeholder="Local do evento"]',
+    '[aria-label="Local do evento"]',
+    '[data-testid*="event" i] input',
+    '[data-testid*="local" i] input'
+  ];
+
+  for(const s of candidatos){
+    const loc=page.locator(s).first();
+    if(await loc.count() && await loc.isVisible().catch(()=>false)){
+      return loc;
+    }
+  }
+
+  throw new Error('Não encontrei o campo "Local do evento".');
+}
+
+async function selecionarLocalEvento(page){
+  const valor='Dentro unidade';
+  log(`Selecionando Local do evento: ${valor}`);
+
+  const campo=await localizarCampoLocalEvento(page);
+
+  const atual=(
+    (await campo.inputValue().catch(()=>'')) ||
+    (await campo.innerText().catch(()=>''))
+  ).replace(/\s+/g,' ').trim();
+
+  if(/Dentro unidade/i.test(atual)){
+    log('Local do evento já está correto: Dentro unidade');
+    return;
+  }
+
+  await campo.click({timeout:10000});
+  await sleep(450);
+
+  let opt=page.getByText(valor,{exact:true}).last();
+
+  if(!(await opt.count())){
+    opt=page.locator('.ant-select-item-option, [role="option"], li, div')
+      .filter({hasText:/^\s*Dentro unidade\s*$/i})
+      .last();
+  }
+
+  if(!(await opt.count())){
+    throw new Error('Não encontrei a opção "Dentro unidade" em "Local do evento".');
+  }
+
+  await opt.click({timeout:10000});
+  await sleep(900);
+
+  const depois=(
+    (await campo.inputValue().catch(()=>'')) ||
+    (await campo.innerText().catch(()=>''))
+  ).replace(/\s+/g,' ').trim();
+
+  // Alguns componentes limpam o texto do input depois da escolha,
+  // então também aceitamos a presença da opção selecionada visível na região do campo.
+  if(depois && !/Dentro unidade/i.test(depois)){
+    const visivel=page.getByText('Dentro unidade',{exact:true}).first();
+    if(!(await visivel.count())){
+      throw new Error(
+        `O campo "Local do evento" não confirmou "Dentro unidade". Valor atual: "${depois}".`
+      );
+    }
+  }
+
+  log('Local do evento confirmado: Dentro unidade');
+}
+
+async function selecionarLocalidade(page){
+  // Regra correta confirmada no Guardian:
+  // Local do evento = Dentro unidade
+  // Não há filtro adicional de Unidade/Jacarei.
+  await selecionarLocalEvento(page);
+  log('Filtro de localidade validado: Dentro unidade.');
 }
 
 async function prepararEBuscar(page,item,p){
@@ -252,6 +588,7 @@ async function prepararEBuscar(page,item,p){
   await limparFiltros(page);
   await selecionarPeriodo(page);
   await preencherDatas(page,p);
+  await selecionarLocalidade(page);
   await selecionarTipo(page,item.nome);
 
   const buscar=page.getByRole('button',{name:/Buscar registros/i}).first();
@@ -273,41 +610,189 @@ async function prepararEBuscar(page,item,p){
     throw new Error(`O botão "Exportar relatório" não habilitou para ${item.nome}.`);
   }
 
+  // Confirma novamente os filtros imediatamente antes de exportar.
+  // Se o Guardian tiver limpado algum campo após "Buscar registros",
+  // paramos em vez de gerar um relatório incorreto.
+  const selTipo=await localizarCampoTipo(page);
+  const tiposConfirmados=await selecionadosNoCampo(selTipo);
+
+  if(tiposConfirmados.length!==1 || tiposConfirmados[0]!==item.nome){
+    throw new Error(
+      `Filtro mudou após a busca. Esperado somente "${item.nome}", encontrado: ` +
+      (tiposConfirmados.length ? tiposConfirmados.join(', ') : 'nenhum tipo')
+    );
+  }
+
+  const localEvento=await localizarCampoLocalEvento(page);
+
+  const localTxt=(
+    (await localEvento.inputValue().catch(()=>'')) ||
+    (await localEvento.innerText().catch(()=>''))
+  ).replace(/\s+/g,' ').trim();
+
+  // Confirma novamente o filtro imediatamente antes de exportar.
+  // Se o componente não mantiver o texto dentro do input, procuramos
+  // a opção/valor "Dentro unidade" visível na página.
+  if(localTxt && !/Dentro unidade/i.test(localTxt)){
+    const localVisivel=page.getByText('Dentro unidade',{exact:true}).first();
+    if(!(await localVisivel.count())){
+      throw new Error(
+        `Local do evento não está em "Dentro unidade" antes da exportação. Atual: "${localTxt}"`
+      );
+    }
+  }
+
   await sleep(1800);
   await exportar.click({timeout:10000});
   log(`Exportação solicitada: ${item.nome}`);
 }
 
-async function aguardarPedidoAparecer(page,item,p,segundos=45){
+async function aguardarNovoPedido(page,item,p,quantidadeAntes,segundos=90){
   const limite=Date.now()+segundos*1000;
+
   while(Date.now()<limite){
-    const info=await infoUltimaLinha(page,item,p);
-    if(info.row && info.text.includes(p.fim)){
-      log(`Pedido apareceu em Downloads: ${item.nome}.`);
-      return true;
+    const quantidadeAgora=await contarPedidosValidosAtuais(page,item,p);
+
+    if(quantidadeAgora>quantidadeAntes){
+      const info=await infoUltimaLinha(page,item,p);
+      log(
+        `NOVO pedido correto confirmado: ${item.nome} ` +
+        `(${quantidadeAntes} -> ${quantidadeAgora}).`
+      );
+      return info;
     }
+
     await sleep(4000);
   }
-  return false;
+
+  return null;
 }
 
 async function garantirPedido(page,item,p){
-  if(await linhaExiste(page,item,p)) return;
+  // REGRA V2.5.5:
+  // Se existe um pedido correto (tipo exato + período + localidade)
+  // feito há no máximo 30 minutos, NÃO gera novamente.
+  const recente=await infoPedidoRecente(page,item,p);
 
-  for(let tentativa=1; tentativa<=2; tentativa++){
-    log(`Não existe pedido atual de ${item.nome}. Tentativa ${tentativa}/2.`);
+  if(recente){
+    log(
+      `Reaproveitando ${item.nome}: pedido de ${recente.idadeMin.toFixed(1)} min atrás ` +
+      `(${recente.status}). Não será gerado novamente.`
+    );
+    return recente;
+  }
+
+  // Só chega aqui se este indicador realmente estiver faltando
+  // ou se o último pedido correto tiver mais de 30 minutos.
+  for(let tentativa=1;tentativa<=2;tentativa++){
+    // Antes de CADA tentativa, consulta novamente.
+    // Se a tentativa anterior apareceu com atraso, não duplica.
+    const apareceuEnquantoEsperava=await infoPedidoRecente(page,item,p);
+    if(apareceuEnquantoEsperava){
+      log(
+        `${item.nome} apareceu na consulta antes da nova tentativa. ` +
+        `Reaproveitando e evitando pedido duplicado.`
+      );
+      return apareceuEnquantoEsperava;
+    }
+
+    const quantidadeAntes=await contarPedidosValidosAtuais(page,item,p);
+
+    log(
+      `Gerando SOMENTE o relatório faltante: ${item.nome}. ` +
+      `Pedido(s) correto(s) existentes: ${quantidadeAntes}. Tentativa ${tentativa}/2.`
+    );
+
     await prepararEBuscar(page,item,p);
 
-    if(await aguardarPedidoAparecer(page,item,p,45)) return;
+    const novo=await aguardarNovoPedido(page,item,p,quantidadeAntes,90);
+    if(novo) return novo;
 
-    log(`O pedido de ${item.nome} ainda não apareceu em Downloads.`);
+    // Consulta final antes de cogitar a segunda exportação.
+    const tardio=await infoPedidoRecente(page,item,p);
+    if(tardio){
+      log(
+        `${item.nome} apareceu com atraso em Downloads. ` +
+        `Reaproveitando e NÃO gerando novamente.`
+      );
+      return tardio;
+    }
+
+    log(`Nenhum pedido correto e recente de ${item.nome} apareceu em Downloads.`);
+
     if(tentativa<2){
-      log(`Vou repetir somente ${item.nome}.`);
-      await sleep(2500);
+      log(`Vou repetir SOMENTE ${item.nome}, pois ele continua faltando.`);
+      await sleep(3000);
     }
   }
 
-  throw new Error(`O Guardian não criou o pedido de ${item.nome} em Downloads após 2 tentativas.`);
+  throw new Error(
+    `O Guardian não criou um pedido correto de ${item.nome} após 2 tentativas.`
+  );
+}
+
+
+async function preVerificarDownloads(page,p){
+  log('');
+  log('===== PRÉ-VERIFICAÇÃO DA PÁGINA DOWNLOADS =====');
+  log(`Janela de reaproveitamento: ${REUSO_MINUTOS} minutos.`);
+
+  const plano = new Map();
+
+  for(const item of TIPOS){
+    const info = await infoUltimaLinha(page,item,p);
+
+    if(
+      info.row &&
+      info.status !== 'erro' &&
+      Number.isFinite(info.idadeMin) &&
+      info.idadeMin <= REUSO_MINUTOS
+    ){
+      plano.set(item.nome,{
+        acao:'reaproveitar',
+        status:info.status,
+        idadeMin:info.idadeMin,
+        text:info.text
+      });
+
+      if(info.status==='pronto'){
+        log(
+          `[REUSAR] ${item.nome}: pedido correto de ${info.idadeMin.toFixed(1)} min atrás, já pronto.`
+        );
+      }else{
+        log(
+          `[AGUARDAR] ${item.nome}: pedido correto de ${info.idadeMin.toFixed(1)} min atrás ainda processando.`
+        );
+      }
+    }else{
+      plano.set(item.nome,{
+        acao:'gerar',
+        status:info.status || 'ausente',
+        idadeMin:info.idadeMin
+      });
+
+      if(info.row && Number.isFinite(info.idadeMin)){
+        log(
+          `[GERAR] ${item.nome}: último pedido correto tem ${info.idadeMin.toFixed(1)} min (> ${REUSO_MINUTOS}).`
+        );
+      }else{
+        log(`[GERAR] ${item.nome}: não há pedido correto e recente.`);
+      }
+    }
+  }
+
+  const faltantes = TIPOS.filter(item => plano.get(item.nome)?.acao === 'gerar');
+
+  if(!faltantes.length){
+    log('Pré-verificação concluída: nenhum relatório precisa ser gerado agora.');
+  }else{
+    log(
+      'Pré-verificação concluída. Será(ão) gerado(s) somente: ' +
+      faltantes.map(x=>x.nome).join(' | ')
+    );
+  }
+
+  return plano;
 }
 
 async function esperarPronto(page,item,p){
@@ -316,15 +801,21 @@ async function esperarPronto(page,item,p){
 
   while(Date.now()<limite){
     const info=await infoUltimaLinha(page,item,p);
-    if(info.row && info.text.includes(p.fim)){
-      if(/Pronto para download/i.test(info.text)){
-        log(`${item.nome} está pronto.`);
+
+    if(info.row){
+      if(info.status==='pronto'){
+        log(
+          `${item.nome} está pronto. Pedido de ` +
+          `${Number.isFinite(info.idadeMin) ? info.idadeMin.toFixed(1) : '?'} min atrás.`
+        );
         return info.row;
       }
-      if(/Falha|Erro/i.test(info.text)){
+
+      if(info.status==='erro'){
         throw new Error(`Guardian informou falha em ${item.nome}: ${info.text}`);
       }
     }
+
     await sleep(5000);
   }
 
@@ -597,7 +1088,7 @@ async function main(){
   ensureDir(CFG.chrome_profile_dir);
 
   console.log('============================================================');
-  console.log(' GUARDIAN 504 - V2.5.1 FINAL');
+  console.log(' GUARDIAN 504 - V2.5.9 STATUS CENTRAL CORRIGIDO');
   console.log(' Guardian > 4 Relatorios > Portal Seguranca > Novo Index');
   console.log('============================================================');
   log(`Período: ${p.inicio} até ${p.fim}`);
@@ -616,9 +1107,23 @@ async function main(){
   try{
     await esperarGuardian(page);
 
+    // Antes de tocar em qualquer filtro do Guardian, olha a página Downloads
+    // e decide exatamente o que está faltando com base no horário.
+    const plano = await preVerificarDownloads(page,p);
+
     for(const item of TIPOS){
+      const decisao = plano.get(item.nome);
+
+      if(decisao?.acao === 'reaproveitar'){
+        log('');
+        log(
+          `===== ${item.nome}: PEDIDO RECENTE ENCONTRADO - NÃO GERAR NOVAMENTE =====`
+        );
+        continue;
+      }
+
       log('');
-      log(`===== VALIDANDO ${item.nome} =====`);
+      log(`===== GERANDO SOMENTE O FALTANTE: ${item.nome} =====`);
       await garantirPedido(page,item,p);
     }
 
@@ -638,16 +1143,33 @@ async function main(){
     log('');
     log('=== PROCESSO CONCLUÍDO ===');
     log('Guardian atualizado e Portal Segurança regenerado.');
-    console.log('Pressione ENTER para fechar.');
-    await esperarEnter();
+
+    // Quando chamado pela Central 504, NÃO pode ficar esperando ENTER.
+    // A Central só registra SUCESSO quando este processo realmente termina.
+    if(EXECUTADO_PELA_CENTRAL){
+      log('Execução pela Central 504: encerrando automaticamente com SUCESSO.');
+      process.exitCode = 0;
+    }else{
+      console.log('Pressione ENTER para fechar.');
+      await esperarEnter();
+    }
 
   }catch(e){
     console.error('');
     console.error('=== FALHA ===');
     console.error(e && e.stack ? e.stack : e);
     console.error('');
-    console.error('Pressione ENTER para encerrar.');
-    await esperarEnter();
+
+    // Antes o catch terminava sem código de erro; isso podia mascarar falhas.
+    // Agora a Central recebe exit code 1 e grava ERRO corretamente.
+    process.exitCode = 1;
+
+    if(EXECUTADO_PELA_CENTRAL){
+      log('Execução pela Central 504: encerrando automaticamente com ERRO.');
+    }else{
+      console.error('Pressione ENTER para encerrar.');
+      await esperarEnter();
+    }
   }finally{
     await context.close().catch(()=>{});
   }
